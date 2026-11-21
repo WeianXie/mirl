@@ -45,6 +45,13 @@
 # Launch (from $WORK/mirl, branch feat/healthbench-pro):
 #   sbatch scripts/self_evolving/train/slurm_b200_healthbench.sbatch                # control arm
 #   RETRIEVAL=1 sbatch scripts/self_evolving/train/slurm_b200_healthbench.sbatch    # retrieval arm
+#   NOVELTY_N=4 sbatch scripts/self_evolving/train/slurm_b200_healthbench.sbatch    # Best-of-4 novelty
+#   2-GPU variant (backfills sooner; ~2x slower steps, so checkpoint more often):
+#   SAVE_FREQ=5 sbatch --gres=gpu:b200:2 --cpus-per-task=32 --mem=300G scripts/.../slurm_b200_healthbench.sbatch
+# Metrics for the novelty/category report (both arms log the same set):
+#   $EXP_LOG/gen/server_{candidates,embeddings,served,metrics,reports}_*.jsonl
+#   $EXP_LOG/trainer_metrics_<jobid>.jsonl   (verl file logger: train + val per step)
+#   report: scripts/self_evolving/report_novelty.py --run control=<EXP_LOG> --run bon=<EXP_LOG>
 # Resubmitting with the same EXPERIMENT_NAME resumes from its last checkpoint.
 # Proposer analysis (weianxie's instrumentation, now also logged in rubric mode):
 #   python scripts/self_evolving/analyze_proposer.py --log_dir $LOG_DIR/$EXPERIMENT_NAME/gen
@@ -63,7 +70,15 @@ SCRATCH=${SCRATCH:-/scratch/dvdai_mit/weianxie}
 CKPT_ROOT=${CKPT_ROOT:-$SCRATCH/checkpoints/healthbench}
 MODEL=${MODEL:-Qwen/Qwen3.5-9B}
 RETRIEVAL=${RETRIEVAL:-0}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-hbpro_qwen35_9b_$([ "$RETRIEVAL" = 1 ] && echo retrieval || echo control)}
+# Best-of-N novelty selection in the gen server (1 = control: no selection, same
+# metrics logged). See scripts/self_evolving/novelty.py.
+NOVELTY_N=${NOVELTY_N:-1}
+# GPU count follows the allocation (sbatch --gres=gpu:b200:N). Fewer GPUs backfill
+# far sooner for a low-fair-share account (2-GPU median wait 0.6 h vs 10.7 h for 4
+# GPUs, Nov 2026); same recipe, slower steps. Non-4 runs get their own name so they
+# never share checkpoints/logs with a 4-GPU run.
+NGPU=${NGPU:-${SLURM_GPUS_ON_NODE:-$(echo "${CUDA_VISIBLE_DEVICES:-0,1,2,3}" | tr , '\n' | wc -l)}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-hbpro_qwen35_9b_$([ "$RETRIEVAL" = 1 ] && echo retrieval || echo control)$([ "$NOVELTY_N" -gt 1 ] && echo "_bon$NOVELTY_N")$([ "$NGPU" != 4 ] && echo "_${NGPU}gpu")}
 VAL=$DATA_DIR/healthbench_pro_val.parquet
 
 TRAPI_BASE=${TRAPI_BASE:-http://point.dd.works:18890/v1}
@@ -127,6 +142,9 @@ else
     printf '%s' "$WANDB_RUN_ID" > "$RUNID_FILE"
 fi
 export WANDB_RESUME=allow
+# Local copy of every trainer metric (train + val, per step, with wall-clock ts) for
+# the offline report. Per job id because verl's FileLogger truncates on open.
+export VERL_FILE_LOGGER_PATH="$EXP_LOG/trainer_metrics_${SLURM_JOB_ID:-local}.jsonl"
 
 export CHAT_PROVIDER=trapi
 # gpt-chat-latest rejects reasoning_effort="none", which the gen server sends on
@@ -192,7 +210,7 @@ if [ "$RETRIEVAL" = 1 ]; then
     )
     # Frozen self-model summarizer (same flags as serve/serve_summarizer.sh, plus the
     # B200 flash-attn v2 pin this SIF needs — see slurm_b200_selfimprove.sbatch).
-    CUDA_VISIBLE_DEVICES=${SUMM_GPU:-3} HF_HUB_OFFLINE=1 \
+    CUDA_VISIBLE_DEVICES=${SUMM_GPU:-$((NGPU - 1))} HF_HUB_OFFLINE=1 \
     NVCC_PREPEND_FLAGS=-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK \
         $RUN vllm serve "$MODEL" --trust-remote-code --served-model-name "$MODEL" \
         --host 127.0.0.1 --port "$SUMM_PORT" --tensor-parallel-size 1 --dtype bfloat16 \
@@ -213,18 +231,25 @@ fi
 
 # ---- gen server: co-generates the TRAINING tasks + rubrics (both arms) ----------
 cd "$REPO"
+# The job runs whatever is on disk when it STARTS, so record exactly that.
+CODE_SNAP="$EXP_LOG/code_${SLURM_JOB_ID:-local}"
+{ git rev-parse HEAD; git status --short; } > "$CODE_SNAP.txt" 2>&1 || true
+git diff HEAD > "$CODE_SNAP.diff" 2>/dev/null || true
+git ls-files -o --exclude-standard -z | tar --null -czf "$CODE_SNAP.untracked.tgz" -T - 2>/dev/null || true
 if curl -sf -m 5 "localhost:$GEN_PORT/healthz" >/dev/null 2>&1; then
     echo "FATAL: port $GEN_PORT already serving (orphan?)" >&2; exit 1
 fi
-$RUN_CPU python scripts/self_evolving/generation_server.py \
+# Key via env (GEN_SERVER_API_KEY), not argv, so it is not visible in `ps`.
+GEN_SERVER_API_KEY="$TRAPI_KEY" $RUN_CPU python scripts/self_evolving/generation_server.py \
     --rubric_mode --prompt_dir "$EXP_LOG/prompts" \
-    --api_base "$TRAPI_BASE" --api_key "$TRAPI_KEY" --model_name "$JUDGE" \
+    --api_base "$TRAPI_BASE" --model_name "$JUDGE" \
     --embed_api_base "$EMBED_BASE" --embed_model Qwen/Qwen3-VL-Embedding-2B \
     --milvus_uri "$MILVUS_URI" --milvus_token root:Milvus \
     --milvus_collection medical_knowledge_v2 --milvus_top_k 8 \
     --retrieve_top_k "${RETRIEVE_TOP_K:-5}" --retrieve_total "${RETRIEVE_TOTAL:-16}" \
     "${SUMM_FLAGS[@]}" \
     --n_queries "${N_QUERIES:-6}" --questions_per_query 1 \
+    --novelty_best_of_n "$NOVELTY_N" --novelty_ref_parquet "$VAL" \
     --accuracy_window 64 --max_pool_size 200 \
     --workers "${GEN_WORKERS:-8}" --log_dir "$EXP_LOG/gen" \
     --host 127.0.0.1 --port "$GEN_PORT" \
@@ -254,7 +279,7 @@ fi
 # 9B quirk: head_dim=256 breaks the FlashAttention varlen kernel -> use_remove_padding
 # =False + sdpa.
 set +e
-CUDA_VISIBLE_DEVICES=0,1,2,3 $RUN python -m verl.trainer.main_ppo \
+CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NGPU - 1))) $RUN python -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
@@ -331,12 +356,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 $RUN python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$LOGPROB_MAX_TOKEN_LEN" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="$LOGPROB_MAX_TOKEN_LEN" \
     critic.enable=False \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node="$NGPU" \
     trainer.nnodes=1 \
     trainer.total_epochs=100 \
     trainer.total_training_steps="${STEPS:-60}" \
     trainer.test_freq="${TEST_FREQ:-5}" \
-    trainer.save_freq=20 \
+    trainer.save_freq="${SAVE_FREQ:-20}" \
     trainer.val_before_train=True \
     +trainer.max_actor_ckpt_to_keep=1 \
     trainer.resume_mode=auto \
@@ -345,7 +370,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 $RUN python -m verl.trainer.main_ppo \
     +trainer.validation_data_dir="$EXP_LOG/val_generations" \
     trainer.project_name=self_evolving_medical \
     trainer.experiment_name="$EXPERIMENT_NAME" \
-    'trainer.logger=["console","wandb"]' \
+    'trainer.logger=["console","wandb","file"]' \
     +ray_init.address=local \
     "${AGENT_ARGS[@]}" \
     "$@"

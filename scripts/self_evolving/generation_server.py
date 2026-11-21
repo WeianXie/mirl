@@ -43,7 +43,7 @@ import re
 import sys
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -54,6 +54,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 logger = logging.getLogger("gen_server")
+
+# Best-of-N novelty selection + embedding/category instrumentation (rubric mode).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import novelty as nov  # noqa: E402
 
 
 # ======================================================================
@@ -676,6 +680,23 @@ class ServerState:
         # diagnosis-mode QueryProposer and the rubric-mode (HealthBench) task
         # proposer, so analyze_proposer.py works on either kind of run.
         self.proposer_log = os.path.join(args.log_dir, f"server_proposer_{ts}.jsonl")
+        # Novelty / category instrumentation (rubric mode; identical in both arms):
+        #   server_candidates_*  one row per proposed candidate (selected or not)
+        #   server_embeddings_*  fp16 embeddings of candidates + accepted tasks
+        #   server_served_*      every /sample hand-out (pool vs history fallback)
+        #   server_metrics_*     60 s snapshots of counters + rolling windows
+        self.candidates_log = os.path.join(args.log_dir, f"server_candidates_{ts}.jsonl")
+        self.embeddings_log = os.path.join(args.log_dir, f"server_embeddings_{ts}.jsonl")
+        self.served_log = os.path.join(args.log_dir, f"server_served_{ts}.jsonl")
+        self.metrics_log = os.path.join(args.log_dir, f"server_metrics_{ts}.jsonl")
+        # H for the novelty formula (accepted REQUESTS) and its task-text twin.
+        self.req_hist = nov.EmbeddingHistory("requests")
+        self.task_hist = nov.EmbeddingHistory("tasks")
+        self.ref_hist = nov.EmbeddingHistory("reference")  # val prompts, metric only
+        self.classifier = nov.CategoryClassifier()
+        self.recent_accepted: deque = deque(maxlen=200)  # rows for rolling snapshots
+        self.recent_reports: deque = deque(maxlen=4096)  # (ts, qid, score)
+        self.served_counts: dict[str, int] = defaultdict(int)
         self.log_lock = asyncio.Lock()
         self.evolve_lock = asyncio.Lock()
 
@@ -2172,9 +2193,161 @@ def _build_entry_rubric(state: ServerState, gen: dict, knowledge: str,
     }
 
 
+async def _propose_candidates(state: ServerState, use_case: str, specialty: str,
+                              language: str, n_calls: int) -> tuple[list[dict], int]:
+    """`n_calls` independent proposer calls for one (use_case, specialty, mode,
+    language) cell. Each call draws its own KB anchor and style seed exactly as a
+    control iteration does, so the pooled candidates are n_calls i.i.d. draws of the
+    control proposal and the category marginals stay matched across arms."""
+
+    async def one(j: int) -> list[dict]:
+        anchor = ""
+        if random.random() < _hb_anchor_share():
+            anchor = await _random_kb_anchor(state)
+        style_seed = _sample_style_seed()
+        reqs = await agent_task_proposer(state, use_case, specialty, anchor, language, style_seed)
+        return [{"text": r, "call": j, "anchored": bool(anchor), "style_seed": style_seed}
+                for r in reqs]
+
+    results = await asyncio.gather(*[one(j) for j in range(n_calls)], return_exceptions=True)
+    cands: list[dict] = []
+    n_failed = 0
+    for r in results:
+        if isinstance(r, BaseException):
+            n_failed += 1
+            logger.warning(f"task proposer failed: {type(r).__name__}: {r!r}")
+        else:
+            cands.extend(r)
+    return cands, n_failed
+
+
+async def _attempt_rubric_request(state: ServerState, worker_id: int, request: str,
+                                  embedding, use_case: str, specialty: str, mode: str,
+                                  proposal_id: str, language: str, anchored: bool,
+                                  outcome: dict) -> tuple[str, Optional[dict], Optional[dict]]:
+    """Retrieve grounding, co-generate task + rubric, push to the pool.
+
+    Returns (status, entry, gen) with status in accepted | gen_error | sft_failed.
+    `embedding` (from the batched candidate embed) is reused for the Milvus search;
+    None falls back to embedding the request here."""
+    knowledge = ""
+    try:
+        if embedding is not None:
+            async with timed(state, "milvus_search"):
+                hits = await asyncio.to_thread(
+                    _milvus_search_sync, state, list(map(float, embedding)),
+                    state.args.milvus_top_k, "")
+        else:
+            hits, embedding = await _milvus_search_with_emb(
+                state, request, top_k=state.args.milvus_top_k)
+        outcome["embedding"] = list(map(float, embedding)) if embedding is not None else None
+        if hits:
+            outcome["n_hits"] = len(hits)
+            outcome["top_sources"] = [h.get("source", "") for h in hits[:5]]
+            scores = [h.get("score") for h in hits if isinstance(h.get("score"), (int, float))]
+            if scores:
+                outcome["mean_retrieval_score"] = sum(scores) / len(scores)
+            knowledge = "\n\n".join(
+                f"[passage {i + 1} / source={h.get('source', '?')}]\n{h['text']}"
+                for i, h in enumerate(hits)
+            )
+    except Exception as e:
+        logger.debug(f"rubric retrieval failed (continuing ungrounded): {e}")
+    try:
+        gen = await agent_task_rubric_generator(
+            state, request, use_case, specialty, knowledge, mode)
+    except Exception as e:
+        logger.warning(f"worker {worker_id}: rubric generator failed: {type(e).__name__}: {e!r}")
+        state.stats["total_rejected"] += 1
+        outcome["gen_errors"] += 1
+        return "gen_error", None, None
+    entry = _build_entry_rubric(state, gen, knowledge, request)
+    entry["extra_info"]["proposal_id"] = proposal_id
+    # SFT mode: the trainer needs a gold `reference_response`. Rubric mode
+    # never had this hook (rubric + sft had not been combined before), so
+    # entries were accepted target-less and the SFT dataset saw none.
+    if state.args.sft_mode and not await _attach_sft_target(state, entry):
+        state.stats["total_rejected"] += 1
+        state.stats["sft_gold_failed"] = state.stats.get("sft_gold_failed", 0) + 1
+        outcome["rejected"] += 1
+        return "sft_failed", None, None
+    qid = entry["extra_info"]["question_id"]
+    outcome["accepted"] += 1
+    state.qid_meta[qid] = {
+        "source": "gen_task", "proposal_id": proposal_id, "retrieval_query": request,
+    }
+    async with state.log_lock:
+        with open(state.accepted_log, "a") as f:
+            f.write(json.dumps({
+                "ts": datetime.now().isoformat(),
+                "question_id": qid,
+                "use_case": use_case, "specialty": specialty, "mode": mode,
+                "entry": entry,
+            }) + "\n")
+    state.stats["total_accepted"] += 1
+    state.stats["total_generated"] += 1
+    state.mix_counts["gen_task"] += 1
+    state.history.append(entry)
+    await state.pool.put(entry)
+    _maybe_log_sample(entry, "gen_task")
+    logger.info(
+        f"+ gen_task[{use_case}/{specialty}/{mode}"
+        f"{'/' + language if language else ''}{'/anchored' if anchored else ''}] "
+        f"qid={qid} n_rubric={len(gen['rubric_items'])} "
+        f"pool=({state.pool.qsize()}/{state.args.max_pool_size}) "
+        f"generated={state.stats['total_generated']}"
+    )
+    return "accepted", entry, gen
+
+
+def _prefix(d: dict, p: str) -> dict:
+    return {f"{p}{k}": v for k, v in d.items()}
+
+
+async def _task_metrics(state: ServerState, entry: dict, gen: dict, req_emb) -> tuple[dict, Optional[list]]:
+    """Embedding + category metrics of the FINAL task text (what the trainer sees),
+    measured against the accepted-task history, then added to it."""
+    ei = entry["extra_info"]
+    conv = gen.get("conversation") or []
+    items = gen.get("rubric_items") or []
+    out = {
+        "task_chars": len(ei.get("question") or ""),
+        "task_turns": len(conv),
+        "n_rubric": len(items),
+        "n_neg_rubric": sum(1 for it in items if it.get("points", 0) < 0),
+        "rubric_pos_points": sum(it["points"] for it in items if it.get("points", 0) > 0),
+        "difficulty": gen.get("difficulty", "typical"),
+    }
+    try:
+        temb = await _embed_text(state, ei.get("question") or "")
+    except Exception as e:
+        logger.debug(f"task embed failed: {e}")
+        return out, None
+    tv = _np.asarray(temb, dtype=_np.float32)[None, :]
+    hs = state.task_hist.stats(tv)[0]
+    out.update({"task_hist_max_cos": hs["max_cos"], "task_hist_knn_cos": hs["knn_cos"],
+                "task_hist_nn_qid": hs["nn_id"], "task_novelty": hs["novelty"]})
+    if len(state.ref_hist):
+        rs = state.ref_hist.stats(tv)[0]
+        out.update({"task_ref_max_cos": rs["max_cos"], "task_ref_knn_cos": rs["knn_cos"]})
+    if req_emb is not None:
+        out["req_task_cos"] = nov.pairwise_cos(req_emb, tv)
+    if state.classifier.ready:
+        out.update(_prefix(state.classifier.classify(tv)[0], "task_obs_"))
+    state.task_hist.add(tv[0], ei["question_id"])
+    return out, temb
+
+
 async def _rubric_iteration(state: ServerState, worker_id: int) -> None:
     """One rubric-mode generation iteration: pick use_case x specialty, propose
-    requests, retrieve grounding, co-generate task+rubric, validate, push."""
+    requests, (Best-of-N) select the most novel, retrieve grounding, co-generate
+    task+rubric, push.
+
+    --novelty_best_of_n N: N proposer calls -> N*K candidates; keep the K most
+    novel (1 - max cos to the accepted-request history H, greedy so picks within a
+    batch also count) that pass the validator (seed-leak guard + generator
+    success), replacing failures with the next most novel up to K+slack attempts.
+    N=1 is the control: proposer order, no selection, identical instrumentation."""
     seed = random.choice(state.train_seeds)
     use_case = _weighted_choice(HB_USE_CASES)
     specialty = seed["extra_info"]["specialty"]
@@ -2182,122 +2355,130 @@ async def _rubric_iteration(state: ServerState, worker_id: int) -> None:
     # Diversity sampling (see _random_kb_anchor). The use_case marginal is left
     # alone on purpose: it already matches val (45/28/27), so only the axes that
     # were degenerate — topic and language — are widened here.
-    anchor = ""
-    if random.random() < _hb_anchor_share():
-        anchor = await _random_kb_anchor(state)
     language = ""
     if random.random() < _hb_nonenglish_share():
         language = _weighted_choice(HB_LANGUAGES)
-    style_seed = _sample_style_seed()
+    n_calls = max(1, int(getattr(state.args, "novelty_best_of_n", 1)))
+    keep_k = max(1, int(state.args.n_queries))
+    arm = "best_of_n" if n_calls > 1 else "control"
 
     proposal_id = uuid.uuid4().hex
-    try:
-        requests = await agent_task_proposer(
-            state, use_case, specialty, anchor, language, style_seed)
-    except Exception as e:
-        state.stats["proposer_failures"] += 1
-        logger.warning(f"worker {worker_id}: task proposer failed: {type(e).__name__}: {e!r}")
+    cands, n_failed_calls = await _propose_candidates(state, use_case, specialty, language, n_calls)
+    if n_failed_calls:
+        state.stats["proposer_failures"] += n_failed_calls
+    if not cands:
+        logger.warning(f"worker {worker_id}: all {n_calls} proposer call(s) failed")
         return
-    state.stats["total_queries"] += len(requests)
+    state.stats["total_queries"] += len(cands)
+    state.stats["candidates_proposed"] = state.stats.get("candidates_proposed", 0) + len(cands)
 
-    # One generation per proposed request (capped by questions_per_query).
-    requests = requests[: max(1, int(getattr(state.args, "questions_per_query", 1)) * len(requests))]
-    # Per-request funnel for the proposer log, same shape as the diagnosis-mode
-    # _process_query_inner outcome (analyze_proposer.py reads both). There is no
-    # validator in rubric mode: "rejected" counts the seed-leak guard and SFT-target
-    # failures, "gen_errors" counts generator failures (incl. template echoes).
-    query_outcomes: list[dict] = []
+    # One embed round trip for all candidates; reused for retrieval, novelty and
+    # categories. On failure: no novelty metrics, proposer order, per-request embed.
+    embs = None
+    try:
+        embs = _np.asarray(await _embed_texts(state, [c["text"] for c in cands]), dtype=_np.float32)
+    except Exception as e:
+        state.stats["candidate_embed_failures"] = state.stats.get("candidate_embed_failures", 0) + 1
+        logger.warning(f"worker {worker_id}: candidate embed failed ({type(e).__name__}: {e}); "
+                       f"no novelty this iteration")
+    cand_norm = nov._normalize(embs) if embs is not None else None
+
+    now, now_unix = datetime.now().isoformat(), time.time()
+    n = len(cands)
+    hist_stats = state.req_hist.stats(embs) if embs is not None else [{}] * n
+    ref_stats = state.ref_hist.stats(embs) if (embs is not None and len(state.ref_hist)) else [{}] * n
+    intra = nov.intra_batch_stats(embs) if embs is not None else [{}] * n
+    cats = state.classifier.classify(embs) if (embs is not None and state.classifier.ready) else [{}] * n
+    rows: list[dict] = []
+    for i, c in enumerate(cands):
+        hs, rs = hist_stats[i], ref_stats[i]
+        rows.append({
+            "ts": now, "unix": now_unix, "proposal_id": proposal_id, "worker_id": worker_id,
+            "arm": arm, "best_of_n": n_calls, "keep_k": keep_k,
+            "cand_id": f"{proposal_id}:{i}", "cand_idx": i, "call_idx": c["call"],
+            "text": c["text"][:2000], "n_chars": len(c["text"]),
+            "use_case": use_case, "specialty": specialty, "task_mode": mode,
+            "language": language or "English",
+            "anchored": c["anchored"], "style_seeded": bool(c["style_seed"]),
+            "hist_size": hs.get("hist_size"), "hist_max_cos": hs.get("max_cos"),
+            "hist_knn_cos": hs.get("knn_cos"), "hist_nn_qid": hs.get("nn_id"),
+            "novelty_at_proposal": hs.get("novelty"),
+            "ref_max_cos": rs.get("max_cos"), "ref_knn_cos": rs.get("knn_cos"),
+            **intra[i], **_prefix(cats[i], "obs_"),
+            "selected": False, "pick_rank": None, "novelty_at_pick": None,
+            "outcome": "not_attempted", "qid": None,
+        })
+
+    # ---- selection + validation -------------------------------------------
+    remaining = list(range(n))
+    picked: list = []
     accepted_qids: list[str] = []
-    for request in requests:
+    query_outcomes: list[dict] = []  # legacy proposer-log funnel (attempted only)
+    attempts = 0
+    max_attempts = keep_k if n_calls == 1 else keep_k + int(getattr(state.args, "novelty_attempt_slack", 2))
+    pick_rank = 0
+    task_embs: dict[str, list] = {}
+    while remaining and len(accepted_qids) < keep_k and attempts < max_attempts:
         if state.pool.full():
+            for j in remaining:
+                rows[j]["outcome"] = "pool_full"
             break
+        if n_calls > 1 and cand_norm is not None:
+            idx, nov_pick = nov.greedy_pick(cand_norm, state.req_hist, picked, remaining)
+        else:
+            idx = remaining[0]
+            nov_pick = nov.novelty_of(cand_norm[idx], state.req_hist, picked) if cand_norm is not None else None
+        remaining.remove(idx)
+        row, c = rows[idx], cands[idx]
+        row.update({"selected": True, "pick_rank": pick_rank, "novelty_at_pick": nov_pick})
+        pick_rank += 1
         outcome = {
-            "query": request, "format": "rubric", "n_hits": 0,
+            "query": c["text"], "format": "rubric", "n_hits": 0,
             "top_sources": [], "mean_retrieval_score": None, "embedding": None,
             "seed_leak": False, "gen_errors": 0, "accepted": 0, "rejected": 0,
         }
         query_outcomes.append(outcome)
-        # Enforce "style seeds are never training questions". The proposer is told to
-        # copy register and invent a new scenario; this rejects the cases where it
-        # paraphrased the seed instead. Dropping the request is the cheap outcome —
-        # letting a public benchmark item into the training stream is not.
-        if style_seed and _seed_leak(style_seed.get("text", ""), request):
+        # Enforce "style seeds are never training questions" (part of the validator).
+        if c["style_seed"] and _seed_leak(c["style_seed"].get("text", ""), c["text"]):
             state.stats["seed_leak_rejected"] = state.stats.get("seed_leak_rejected", 0) + 1
             outcome["seed_leak"] = True
             outcome["rejected"] += 1
-            logger.info(f"seed-leak reject: {request[:80]!r}")
+            row["outcome"] = "seed_leak"
+            logger.info(f"seed-leak reject: {c['text'][:80]!r}")
             continue
-        # Optional Milvus grounding (best-effort). The embedding is kept for the
-        # proposer diversity metrics (no extra embed call).
-        knowledge = ""
-        try:
-            hits, embedding = await _milvus_search_with_emb(
-                state, request, top_k=state.args.milvus_top_k)
-            outcome["embedding"] = embedding
-            if hits:
-                outcome["n_hits"] = len(hits)
-                outcome["top_sources"] = [h.get("source", "") for h in hits[:5]]
-                scores = [h.get("score") for h in hits
-                          if isinstance(h.get("score"), (int, float))]
-                if scores:
-                    outcome["mean_retrieval_score"] = sum(scores) / len(scores)
-                knowledge = "\n\n".join(
-                    f"[passage {i + 1} / source={h.get('source', '?')}]\n{h['text']}"
-                    for i, h in enumerate(hits)
-                )
-        except Exception as e:
-            logger.debug(f"rubric retrieval failed (continuing ungrounded): {e}")
-        try:
-            gen = await agent_task_rubric_generator(
-                state, request, use_case, specialty, knowledge, mode)
-        except Exception as e:
-            logger.warning(f"worker {worker_id}: rubric generator failed: {type(e).__name__}: {e!r}")
-            state.stats["total_rejected"] += 1
-            outcome["gen_errors"] += 1
-            continue
-        entry = _build_entry_rubric(state, gen, knowledge, request)
-        entry["extra_info"]["proposal_id"] = proposal_id
-        # SFT mode: the trainer needs a gold `reference_response`. Rubric mode
-        # never had this hook (rubric + sft had not been combined before), so
-        # entries were accepted target-less and the SFT dataset saw none.
-        if state.args.sft_mode and not await _attach_sft_target(state, entry):
-            state.stats["total_rejected"] += 1
-            state.stats["sft_gold_failed"] = state.stats.get("sft_gold_failed", 0) + 1
-            outcome["rejected"] += 1
+        attempts += 1
+        status, entry, gen = await _attempt_rubric_request(
+            state, worker_id, c["text"], embs[idx] if embs is not None else None,
+            use_case, specialty, mode, proposal_id, language, c["anchored"], outcome)
+        row["outcome"] = status
+        row.update({"n_hits": outcome["n_hits"], "mean_retrieval_score": outcome["mean_retrieval_score"],
+                    "top_source": (outcome["top_sources"] or [None])[0]})
+        if status != "accepted":
             continue
         qid = entry["extra_info"]["question_id"]
+        row["qid"] = qid
         accepted_qids.append(qid)
-        outcome["accepted"] += 1
-        state.qid_meta[qid] = {
-            "source": "gen_task", "proposal_id": proposal_id, "retrieval_query": request,
-        }
-        async with state.log_lock:
-            with open(state.accepted_log, "a") as f:
-                f.write(json.dumps({
-                    "ts": datetime.now().isoformat(),
-                    "question_id": entry["extra_info"]["question_id"],
-                    "use_case": use_case, "specialty": specialty, "mode": mode,
-                    "entry": entry,
-                }) + "\n")
-        state.stats["total_accepted"] += 1
-        state.stats["total_generated"] += 1
-        state.mix_counts["gen_task"] += 1
-        state.history.append(entry)
-        await state.pool.put(entry)
-        _maybe_log_sample(entry, "gen_task")
-        logger.info(
-            f"+ gen_task[{use_case}/{specialty}/{mode}"
-            f"{'/' + language if language else ''}{'/anchored' if anchor else ''}] "
-            f"qid={entry['extra_info']['question_id']} n_rubric={len(gen['rubric_items'])} "
-            f"pool=({state.pool.qsize()}/{state.args.max_pool_size}) "
-            f"generated={state.stats['total_generated']}"
-        )
+        if cand_norm is not None:
+            picked.append(cand_norm[idx])
+            state.req_hist.add(embs[idx], qid)
+        try:
+            tm, temb = await _task_metrics(state, entry, gen, embs[idx] if embs is not None else None)
+            row.update(tm)
+            if temb is not None:
+                task_embs[qid] = temb
+        except Exception as e:
+            logger.warning(f"task metrics failed for {qid}: {type(e).__name__}: {e!r}")
+        state.recent_accepted.append(row)
+    state.stats["candidates_selected"] = state.stats.get("candidates_selected", 0) + pick_rank
 
     # ---- proposer instrumentation (rubric mode) -----------------------------
-    batch_embs = [oc.get("embedding") for oc in query_outcomes]
+    requests = [c["text"] for c in cands]
+    batch_embs = [list(map(float, e)) for e in embs] if embs is not None else \
+        [oc.get("embedding") for oc in query_outcomes]
     metrics = {
         **_record_proposal_metrics(state, requests, batch_embs),
         "n_queries": len(requests),
+        "n_selected": pick_rank,
         "zero_hit_queries": sum(
             1 for oc in query_outcomes if oc["n_hits"] == 0 and not oc["seed_leak"]
         ),
@@ -2315,6 +2496,8 @@ async def _rubric_iteration(state: ServerState, worker_id: int) -> None:
         "proposal_id": proposal_id,
         "worker_id": worker_id,
         "mode": "gen_task",
+        "arm": arm,
+        "best_of_n": n_calls,
         "cycle": state.cycle,
         "target_idx": None,
         # One rubric-mode "seed" is a use_case x specialty cell, so seed coverage
@@ -2325,8 +2508,8 @@ async def _rubric_iteration(state: ServerState, worker_id: int) -> None:
         "specialty": specialty,
         "task_mode": mode,
         "language": language or "English",
-        "anchored": bool(anchor),
-        "style_seeded": bool(style_seed),
+        "anchored": any(c["anchored"] for c in cands),
+        "style_seeded": any(bool(c["style_seed"]) for c in cands),
         # Rubric mode has no gen_history retrieval, so no history conditioning.
         "history_hits": None,
         "history_scored_hits": None,
@@ -2336,9 +2519,107 @@ async def _rubric_iteration(state: ServerState, worker_id: int) -> None:
         "accepted_qids": accepted_qids,
         **metrics,
     }
+    emb_lines = []
+    if embs is not None:
+        for i, r in enumerate(rows):
+            emb_lines.append(json.dumps({
+                "cand_id": r["cand_id"], "qid": r["qid"], "kind": "request",
+                "accepted": r["outcome"] == "accepted", "emb": nov.encode_emb(embs[i])}))
+    for qid, temb in task_embs.items():
+        emb_lines.append(json.dumps({"qid": qid, "kind": "task", "accepted": True,
+                                     "emb": nov.encode_emb(temb)}))
     async with state.log_lock:
         with open(state.proposer_log, "a") as f:
             f.write(json.dumps(record) + "\n")
+        with open(state.candidates_log, "a") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+        if emb_lines:
+            with open(state.embeddings_log, "a") as f:
+                f.write("\n".join(emb_lines) + "\n")
+
+
+# ---- novelty instrumentation: startup, snapshots ---------------------------
+async def _novelty_setup(state: ServerState) -> None:
+    """Before workers start: reload H (resumed job), fit the category
+    classifier, embed the reference (val) prompts. Each part is best-effort."""
+    try:
+        n = await asyncio.to_thread(nov.reload_histories, state.args.log_dir,
+                                    state.req_hist, state.task_hist)
+        if n:
+            logger.info(f"novelty: reloaded H with {n} accepted requests, "
+                        f"{len(state.task_hist)} tasks from earlier logs")
+    except Exception as e:
+        logger.warning(f"novelty: history reload failed: {type(e).__name__}: {e!r}")
+    try:
+        texts = state.classifier.all_texts()
+        state.classifier.fit(await _embed_texts(state, texts))
+        logger.info(f"novelty: category classifier fitted on {len(texts)} prototypes")
+    except Exception as e:
+        logger.warning(f"novelty: classifier fit failed (no observed categories): {e!r}")
+    ref = getattr(state.args, "novelty_ref_parquet", "")
+    if ref:
+        try:
+            texts = await asyncio.to_thread(nov.load_reference_texts, ref)
+            for i in range(0, len(texts), 64):
+                batch = texts[i:i + 64]
+                for j, e in enumerate(await _embed_texts(state, batch)):
+                    state.ref_hist.add(e, f"ref{i + j}")
+            logger.info(f"novelty: embedded {len(state.ref_hist)} reference prompts from {ref}")
+        except Exception as e:
+            logger.warning(f"novelty: reference embed failed: {type(e).__name__}: {e!r}")
+
+
+def _mean(vals):
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _metrics_snapshot(s: ServerState) -> dict:
+    acc = list(s.recent_accepted)
+    now = time.time()
+    rec: dict = {
+        "ts": datetime.now().isoformat(), "unix": now,
+        "arm": "best_of_n" if int(getattr(s.args, "novelty_best_of_n", 1)) > 1 else "control",
+        "best_of_n": int(getattr(s.args, "novelty_best_of_n", 1)),
+        "req_hist_size": len(s.req_hist), "task_hist_size": len(s.task_hist),
+        "pool_size": s.pool.qsize(), "served_counts": dict(s.served_counts),
+        "window_accepted": len(acc),
+        "stats": {k: v for k, v in s.stats.items() if isinstance(v, (int, float))},
+    }
+    for k in ("novelty_at_pick", "novelty_at_proposal", "hist_max_cos", "hist_knn_cos",
+              "intra_max_cos", "ref_max_cos", "task_novelty", "task_hist_max_cos",
+              "task_ref_max_cos", "req_task_cos", "task_chars", "n_rubric"):
+        rec[f"win_mean_{k}"] = _mean([r.get(k) for r in acc])
+    for k in ("use_case", "specialty", "language", "task_mode", "obs_task_type",
+              "obs_specialty", "obs_use_case", "task_obs_task_type", "task_obs_specialty"):
+        rec[f"win_entropy_{k}"] = nov.category_entropy(acc, k)
+    rec["win_counts_task_obs_task_type"] = dict(
+        Counter(r.get("task_obs_task_type") for r in acc if r.get("task_obs_task_type")))
+    # Trainer feedback on generated tasks (rubric score per rollout).
+    for win in (60, 600):
+        rr = [(q, a) for (t, q, a) in s.recent_reports if now - t <= win]
+        by_q: dict = defaultdict(list)
+        for q, a in rr:
+            by_q[q].append(a)
+        multi = [v for v in by_q.values() if len(v) >= 2]
+        rec[f"reports_{win}s"] = len(rr)
+        rec[f"reports_{win}s_mean_score"] = _mean([a for _, a in rr])
+        rec[f"reports_{win}s_spread_frac"] = (
+            sum(1 for v in multi if max(v) - min(v) > 1e-6) / len(multi) if multi else None)
+    return rec
+
+
+async def _metrics_loop(s: ServerState) -> None:
+    interval = float(getattr(s.args, "novelty_metrics_interval", 60) or 60)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            rec = _metrics_snapshot(s)
+            async with s.log_lock:
+                with open(s.metrics_log, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+        except Exception as e:
+            logger.warning(f"metrics snapshot failed: {type(e).__name__}: {e!r}")
 
 
 def _weighted_choice(weights: dict[str, float]) -> str:
@@ -4436,9 +4717,13 @@ async def lifespan(app: FastAPI):
             f"{type(e).__name__}: {e}"
         )
 
+    if STATE.rubric_mode:
+        await _novelty_setup(STATE)
     workers = [
         asyncio.create_task(worker_loop(STATE, i)) for i in range(args.workers)
     ]
+    if STATE.rubric_mode:
+        workers.append(asyncio.create_task(_metrics_loop(STATE)))
     # Drain wikidoc telemetry off the /retrieve request path (batched, in a thread).
     workers.append(asyncio.create_task(_wikidoc_writer(STATE)))
     # Probe the summarizer ONCE at startup: a whole run silently training on the
@@ -4761,8 +5046,18 @@ async def stats():
                 if multi else None
             ),
         }
+    novelty = {
+        "best_of_n": int(getattr(s.args, "novelty_best_of_n", 1)),
+        "req_hist_size": len(s.req_hist), "task_hist_size": len(s.task_hist),
+        "ref_size": len(s.ref_hist), "classifier_ready": s.classifier.ready,
+        "served_counts": dict(s.served_counts),
+        "win_mean_novelty_at_pick": _mean([r.get("novelty_at_pick") for r in s.recent_accepted]),
+        "win_mean_task_novelty": _mean([r.get("task_novelty") for r in s.recent_accepted]),
+        "win_mean_task_ref_max_cos": _mean([r.get("task_ref_max_cos") for r in s.recent_accepted]),
+    }
     return {
         "proposer": proposer,
+        "novelty": novelty,
         "feedback_by_source": feedback_by_source,
         "pool_size": s.pool.qsize(),
         "max_pool_size": s.args.max_pool_size,
@@ -4860,6 +5155,15 @@ async def _finalize_served(s, entry: dict, source: str):
         return None
     s.stats["served"] += 1
     _log_served(s, entry, source)
+    s.served_counts[source] += 1
+    try:
+        async with s.log_lock:
+            with open(s.served_log, "a") as f:
+                f.write(json.dumps({"ts": datetime.now().isoformat(), "unix": time.time(),
+                                    "qid": (entry.get("extra_info") or {}).get("question_id"),
+                                    "source": source}) + "\n")
+    except Exception as e:
+        logger.debug(f"served log write failed: {e}")
     return entry
 
 
@@ -4931,6 +5235,7 @@ async def report(payload: ReportPayload):
     acc = float(payload.accuracy)
     s.accuracy_by_id[payload.question_id] = acc
     s.accuracy_history.append(acc)
+    s.recent_reports.append((time.time(), payload.question_id, acc))
     s.stats["reports"] += 1
     # Solvability filter (2026-08-03 seeded-diag post-mortem): a task whose
     # first >=8 graded rollouts show no variance or an extreme mean gives GRPO
@@ -4977,6 +5282,7 @@ async def report(payload: ReportPayload):
         with open(s.report_log, "a") as f:
             f.write(json.dumps({
                 "ts": datetime.now().isoformat(),
+                "unix": time.time(),
                 "question_id": payload.question_id,
                 "accuracy": acc,
                 "source": source,
@@ -5121,7 +5427,8 @@ def main():
                              "seeds are loaded, this share is added to "
                              "--gen_train_target automatically.")
     parser.add_argument("--api_base", required=True, help="vLLM chat /v1 base URL")
-    parser.add_argument("--api_key", default="EMPTY")
+    # Env fallback keeps the key out of the process list (ps) on shared nodes.
+    parser.add_argument("--api_key", default=os.environ.get("GEN_SERVER_API_KEY", "EMPTY"))
     parser.add_argument("--model_name", required=True)
     parser.add_argument("--embed_api_base", required=True, help="vLLM embed /v1 base URL")
     parser.add_argument("--embed_model", required=True)
@@ -5226,6 +5533,20 @@ def main():
              "(~2048 floats per query — large). Diversity metrics are always "
              "computed and logged regardless; turn this on only when you want "
              "offline coverage maps built from the queries themselves.")
+    # --- Best-of-N novelty selection (rubric mode) ----------------------
+    parser.add_argument("--novelty_best_of_n", type=int, default=1,
+                        help="N proposer calls per iteration (N*n_queries candidates); keep "
+                             "the n_queries most novel (1 - max cos to accepted-request "
+                             "history) that pass the validator. 1 = control (no selection; "
+                             "the same metrics are still logged).")
+    parser.add_argument("--novelty_attempt_slack", type=int, default=2,
+                        help="Best-of-N: extra generator attempts per iteration to replace "
+                             "candidates that fail validation (cap = n_queries + slack).")
+    parser.add_argument("--novelty_ref_parquet", default="",
+                        help="Reference prompts (e.g. the HealthBench Pro val parquet) to "
+                             "measure similarity-to-target. METRIC ONLY, never selection.")
+    parser.add_argument("--novelty_metrics_interval", type=float, default=60.0,
+                        help="Seconds between server_metrics_*.jsonl snapshots.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8004)
     args = parser.parse_args()

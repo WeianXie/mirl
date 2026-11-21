@@ -1767,7 +1767,13 @@ class RayPPOTrainer:
         routed_experts = tu.get(output, "routed_experts")
         sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
 
-        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+        metrics = tu.get(output, "metrics")
+        # With DP > 1 the ranks disagree on mfu (each uses its own timing), so TensorDict.cat stacks the
+        # per-rank dicts and tu.get returns a list with one dict per row instead of a dict.
+        if isinstance(metrics, list):
+            old_log_prob_mfu = sum(m["mfu"] for m in metrics) / len(metrics)
+        else:
+            old_log_prob_mfu = metrics["mfu"]
         # step 4. No padding to padding
         entropy = no_padding_2_padding(entropy, batch_td)
         log_probs = no_padding_2_padding(log_probs, batch_td)

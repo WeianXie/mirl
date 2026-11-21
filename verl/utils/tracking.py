@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -283,7 +284,9 @@ class FileLogger:
         self.fp = open(self.filepath, "wb", buffering=0)
 
     def log(self, data, step):
-        data = {"step": step, "data": data}
+        # Wall-clock "ts" lets offline analysis align trainer steps with other
+        # timestamped logs (e.g. the self-evolving gen server's event logs).
+        data = {"step": step, "ts": time.time(), "data": data}
         self.fp.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY) + b"\n")
 
     def finish(self):
