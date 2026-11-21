@@ -16,7 +16,7 @@ Consumers:
   - ``self_evolving.compute_score`` (evolve_enable kwarg) — applies the evolved
     judge prompt + function as the training reward.
   - ``ray_trainer._maybe_evolve_reward`` — calls ``evolve_once`` at end of step.
-  - ``scripts/self_evolving/eval/test_reward_evolution.py`` — offline harness used
+  - ``scripts/self_evolving/mimic/test_reward_evolution.py`` — offline harness used
     to design / validate the meta-prompts on real dumps before production.
 
 This module imports a few helpers from ``self_evolving`` (``_call_api``,

@@ -19,7 +19,7 @@ otherwise-unrelated components must agree on:
 
 1. **Media resolution.** CLIMB image/video files live only on the local node
    (``mib``) under ``/scratch/high_modality`` and are served over HTTP by
-   ``scripts/self_evolving/climb_file_server.py`` (Bearer-auth). The trainer
+   ``scripts/self_evolving/serve/climb_file_server.py`` (Bearer-auth). The trainer
    runs on remote B200 nodes that cannot see those files on disk, so dataset
    rows carry an opaque reference ``"climb://<relpath>"`` (or the dict form
    ``{"climb_path": "<relpath>"}``) instead of a path. ``resolve_climb_media``

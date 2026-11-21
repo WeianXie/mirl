@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the TRAPI reverse proxy (scripts/self_evolving/trapi_proxy.py) in a
+# Launch the TRAPI reverse proxy (scripts/self_evolving/serve/trapi_proxy.py) in a
 # detached tmux session on point.dd.works so it survives SSH disconnects.
 #
 # Downstream (OPD teacher, reward/judge) then point at this instead of the

@@ -30,7 +30,7 @@ fi
 
 cd "$(dirname "$0")/../../.."
 
-exec "$PYTHON_BIN" scripts/self_evolving/climb_file_server.py \
+exec "$PYTHON_BIN" scripts/self_evolving/serve/climb_file_server.py \
     --host "$CLIMB_FILE_HOST" \
     --port "$CLIMB_FILE_PORT" \
     "$@"

@@ -22,4 +22,4 @@ export BIOBERT_HOST="${BIOBERT_HOST:-0.0.0.0}"
 export BIOBERT_MODEL="${BIOBERT_MODEL:-pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb}"
 export BIOBERT_DEVICE="${BIOBERT_DEVICE:-cuda}"
 
-exec "$PYTHON_BIN" scripts/self_evolving/biobert_server.py "$@"
+exec "$PYTHON_BIN" scripts/self_evolving/serve/biobert_server.py "$@"

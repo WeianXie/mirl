@@ -13,7 +13,7 @@ and the overall score is the mean of per-example length-adjusted scores,
 clipped to [0, 1]. See the paper for details.
 
 This is a *different* task and scoring scheme from our MIMIC-IV rare-disease
-eval (scripts/self_evolving/eval_sota.py), so we do NOT reuse compute_score.
+eval (scripts/self_evolving/mimic/eval/eval_sota.py), so we do NOT reuse compute_score.
 Instead we drive OpenAI's reference rubric grader from `openai/simple-evals`:
 we vendor that repo at runtime, convert the HuggingFace dataset
 (`openai/healthbench-professional`) into the HealthBench JSONL format the
